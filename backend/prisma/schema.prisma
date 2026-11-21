@@ -1,0 +1,112 @@
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+model User {
+  id                   String            @id @default(uuid())
+  name                 String
+  email                String            @unique
+  password             String?
+  avatar               String?
+  googleId             String?           @unique
+  resetPasswordToken   String?
+  resetPasswordExpires DateTime?
+  createdAt            DateTime          @default(now())
+  calls                CallParticipant[]
+  roomsCreated         Room[]            @relation("CreatedRooms")
+  memberships          RoomMember[]
+  aiUsages             AIUsage[]
+}
+
+model Room {
+  id            String       @id @default(uuid())
+  name          String
+  code          String       @unique
+  createdBy     String
+  creator       User         @relation("CreatedRooms", fields: [createdBy], references: [id])
+  liveKitRoomId String
+  isPrivate     Boolean      @default(false)
+  aiEnabled     Boolean      @default(true)
+  aiPrompt      String?      @db.Text
+  createdAt     DateTime     @default(now())
+  members       RoomMember[]
+  calls         Call[]
+}
+
+model RoomMember {
+  id       String   @id @default(uuid())
+  userId   String
+  user     User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  roomId   String
+  room     Room     @relation(fields: [roomId], references: [id], onDelete: Cascade)
+  role     String   @default("member")
+  joinedAt DateTime @default(now())
+
+  @@unique([userId, roomId])
+}
+
+model Call {
+  id           String            @id @default(uuid())
+  roomId       String
+  room         Room              @relation(fields: [roomId], references: [id], onDelete: Cascade)
+  startedAt    DateTime          @default(now())
+  endedAt      DateTime?
+  status       String            @default("active")
+  recordingUrl String?
+  participants CallParticipant[]
+  transcript   Transcript?
+  aiUsages     AIUsage[]
+}
+
+model CallParticipant {
+  id       String    @id @default(uuid())
+  callId   String
+  call     Call      @relation(fields: [callId], references: [id], onDelete: Cascade)
+  userId   String
+  user     User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  joinedAt DateTime  @default(now())
+  leftAt   DateTime?
+}
+
+model Transcript {
+  id        String              @id @default(uuid())
+  callId    String              @unique
+  call      Call                @relation(fields: [callId], references: [id], onDelete: Cascade)
+  fullText  String?             @db.Text
+  summary   String?             @db.Text
+  createdAt DateTime            @default(now())
+  segments  TranscriptSegment[]
+}
+
+model TranscriptSegment {
+  id           String     @id @default(uuid())
+  transcriptId String
+  transcript   Transcript @relation(fields: [transcriptId], references: [id], onDelete: Cascade)
+  speakerId    String?
+  speakerName  String?
+  content      String     @db.Text
+  startTime    Float
+  endTime      Float
+  sequence     Int
+  isAi         Boolean    @default(false)
+}
+
+model AIUsage {
+  id            String   @id @default(uuid())
+  userId        String?
+  user          User?    @relation(fields: [userId], references: [id], onDelete: SetNull)
+  callId        String
+  call          Call     @relation(fields: [callId], references: [id], onDelete: Cascade)
+  model         String
+  inputTokens   Int      @default(0)
+  outputTokens  Int      @default(0)
+  sttDuration   Float    @default(0)
+  ttsDuration   Float    @default(0)
+  estimatedCost Float    @default(0)
+  createdAt     DateTime @default(now())
+}
