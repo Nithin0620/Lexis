@@ -2,6 +2,8 @@ import express from "express";
 import cors from "cors";
 import dotenv from "dotenv";
 import authRoutes from "./routes/auth.routes";
+import roomRoutes from "./routes/room.routes";
+import callRoutes from "./routes/call.routes";
 
 dotenv.config();
 
@@ -20,8 +22,10 @@ app.get("/health", (req, res) => {
   res.json({ status: "200", message: "Server is running", Database: "Connected" });
 });
 
-// Auth API
+// APIs
 app.use("/api/auth", authRoutes);
+app.use("/api/rooms", roomRoutes);
+app.use("/api/calls", callRoutes);
 
 app.listen(port, () => {
   console.log(`Server is running on port ${port}`);

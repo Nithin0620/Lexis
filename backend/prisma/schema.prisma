@@ -51,26 +51,30 @@ model RoomMember {
 }
 
 model Call {
-  id           String            @id @default(uuid())
-  roomId       String
-  room         Room              @relation(fields: [roomId], references: [id], onDelete: Cascade)
-  startedAt    DateTime          @default(now())
-  endedAt      DateTime?
-  status       String            @default("active")
-  recordingUrl String?
-  participants CallParticipant[]
-  transcript   Transcript?
-  aiUsages     AIUsage[]
+  id             String            @id @default(uuid())
+  roomId         String
+  room           Room              @relation(fields: [roomId], references: [id], onDelete: Cascade)
+  startedAt      DateTime          @default(now())
+  endedAt        DateTime?
+  status         String            @default("active")
+  recordingUrl   String?
+  participants   CallParticipant[]
+  transcript     Transcript?
+  meetingSummary MeetingSummary?
+  aiUsages       AIUsage[]
 }
 
 model CallParticipant {
-  id       String    @id @default(uuid())
-  callId   String
-  call     Call      @relation(fields: [callId], references: [id], onDelete: Cascade)
-  userId   String
-  user     User      @relation(fields: [userId], references: [id], onDelete: Cascade)
-  joinedAt DateTime  @default(now())
-  leftAt   DateTime?
+  id              String    @id @default(uuid())
+  callId          String
+  call            Call      @relation(fields: [callId], references: [id], onDelete: Cascade)
+  userId          String
+  user            User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  joinedAt        DateTime  @default(now())
+  leftAt          DateTime?
+  speakingSeconds Int       @default(0)
+  wordsSpoken     Int       @default(0)
+  aiInteractions  Int       @default(0)
 }
 
 model Transcript {
@@ -94,6 +98,17 @@ model TranscriptSegment {
   endTime      Float
   sequence     Int
   isAi         Boolean    @default(false)
+}
+
+model MeetingSummary {
+  id               String   @id @default(uuid())
+  callId           String   @unique
+  call             Call     @relation(fields: [callId], references: [id], onDelete: Cascade)
+  overview         String   @db.Text
+  decisions        String[]
+  actionItems      Json
+  participantNotes Json
+  createdAt        DateTime @default(now())
 }
 
 model AIUsage {
