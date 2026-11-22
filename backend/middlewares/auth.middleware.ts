@@ -7,7 +7,9 @@ export interface AuthRequest extends Request {
     id: string;
     email: string;
     name: string;
+    avatar?: string | null;
   };
+  isService?: boolean;
 }
 
 interface JwtPayload {
@@ -15,6 +17,7 @@ interface JwtPayload {
 }
 
 const JWT_SECRET = process.env.JWT_SECRET || "your_super_secret_jwt_key";
+const INTERNAL_SERVICE_KEY = process.env.INTERNAL_SERVICE_KEY || "lexis_internal_service_secret_2026";
 
 export const authenticate = async (
   req: AuthRequest,
@@ -22,6 +25,19 @@ export const authenticate = async (
   next: NextFunction
 ) => {
   try {
+    // 1. Check for Internal Service Key (used by LiveKit Agent worker)
+    const serviceToken = req.headers["x-service-token"] as string;
+    if (serviceToken && serviceToken === INTERNAL_SERVICE_KEY) {
+      req.isService = true;
+      req.user = {
+        id: "service-agent",
+        email: "agent@lexis.internal",
+        name: "Lexis Agent Service",
+      };
+      return next();
+    }
+
+    // 2. Check for User JWT Bearer Token
     const authHeader = req.headers.authorization;
 
     if (!authHeader || !authHeader.startsWith("Bearer ")) {

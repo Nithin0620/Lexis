@@ -75,6 +75,8 @@ model CallParticipant {
   speakingSeconds Int       @default(0)
   wordsSpoken     Int       @default(0)
   aiInteractions  Int       @default(0)
+
+  @@index([callId, userId])
 }
 
 model Transcript {
@@ -98,6 +100,8 @@ model TranscriptSegment {
   endTime      Float
   sequence     Int
   isAi         Boolean    @default(false)
+
+  @@index([transcriptId, sequence])
 }
 
 model MeetingSummary {

@@ -24,6 +24,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("lexis-voice-agent")
 
 BACKEND_API_URL = os.getenv("BACKEND_API_URL", "http://localhost:5000/api")
+BACKEND_SERVICE_TOKEN = os.getenv("BACKEND_SERVICE_TOKEN", "lexis_internal_service_secret_2026")
 
 DEFAULT_SYSTEM_PROMPT = """
 You are Lexis, an intelligent voice AI participant in a group meeting call.
@@ -55,7 +56,10 @@ async def post_transcript_segment(call_id: str, speaker_id: str, speaker_name: s
 
     try:
         async with aiohttp.ClientSession() as session:
-            headers = {"Content-Type": "application/json"}
+            headers = {
+                "Content-Type": "application/json",
+                "x-service-token": BACKEND_SERVICE_TOKEN,
+            }
             async with session.post(url, json=payload, headers=headers) as resp:
                 if resp.status in (200, 201):
                     logger.info(f"Saved segment from {speaker_name}: '{text[:30]}...'")

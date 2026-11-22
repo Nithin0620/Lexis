@@ -1,6 +1,7 @@
 import { Response } from "express";
 import prisma from "../prisma";
 import { AuthRequest } from "../middlewares/auth.middleware";
+import { generateMeetingSummaryFromTranscript } from "../services/ai.service";
 
 /**
  * 1. Start a Call in a Room
@@ -460,5 +461,96 @@ export const saveMeetingSummary = async (req: AuthRequest, res: Response) => {
   } catch (error) {
     console.error("Save meeting summary error:", error);
     return res.status(500).json({ error: "Internal server error" });
+  }
+};
+
+/**
+ * 9. Trigger LLM to Analyze Transcript and Generate Structured Meeting Summary
+ */
+export const generateCallSummary = async (req: AuthRequest, res: Response) => {
+  try {
+    if (!req.user) {
+      return res.status(401).json({ error: "Unauthorized" });
+    }
+
+    const id = req.params.id as string;
+
+    if (!id) {
+      return res.status(400).json({ error: "Call id is required" });
+    }
+
+    const call = await prisma.call.findUnique({
+      where: { id },
+      include: {
+        transcript: true,
+        participants: {
+          include: {
+            user: { select: { id: true, name: true } },
+          },
+        },
+      },
+    });
+
+    if (!call) {
+      return res.status(404).json({ error: "Call not found" });
+    }
+
+    if (!call.transcript || !call.transcript.fullText || !call.transcript.fullText.trim()) {
+      return res.status(400).json({
+        error: "Call has no transcript to summarize. Participants must speak before generating a summary.",
+      });
+    }
+
+    const participantNames = call.participants.map((p) => p.user.name);
+
+    // Call the LLM service to analyze transcript
+    const summaryResult = await generateMeetingSummaryFromTranscript(
+      call.transcript.fullText,
+      participantNames
+    );
+
+    // Save into MeetingSummary table
+    const savedSummary = await prisma.meetingSummary.upsert({
+      where: { callId: id },
+      create: {
+        callId: id,
+        overview: summaryResult.overview,
+        decisions: summaryResult.decisions,
+        actionItems: summaryResult.actionItems,
+        participantNotes: summaryResult.participantNotes,
+      },
+      update: {
+        overview: summaryResult.overview,
+        decisions: summaryResult.decisions,
+        actionItems: summaryResult.actionItems,
+        participantNotes: summaryResult.participantNotes,
+      },
+    });
+
+    // Record AI token usage metric in database
+    await prisma.aIUsage.create({
+      data: {
+        callId: id,
+        userId: req.user.id !== "service-agent" ? req.user.id : null,
+        model: summaryResult.modelUsed,
+        inputTokens: summaryResult.inputTokens,
+        outputTokens: summaryResult.outputTokens,
+        estimatedCost: summaryResult.estimatedCost,
+      },
+    });
+
+    return res.json({
+      message: "Meeting summary generated successfully",
+      summary: savedSummary,
+      metrics: {
+        model: summaryResult.modelUsed,
+        inputTokens: summaryResult.inputTokens,
+        outputTokens: summaryResult.outputTokens,
+        estimatedCost: summaryResult.estimatedCost,
+      },
+    });
+  } catch (error) {
+    console.error("Generate call summary error:", error);
+    return res.status(500).json({ error: "Internal server error generating summary" });
   }
 };

@@ -8,6 +8,7 @@ import {
   saveTranscriptSegment,
   getCallTranscript,
   saveMeetingSummary,
+  generateCallSummary,
 } from "../controller/call.controller";
 import { authenticate } from "../middlewares/auth.middleware";
 
@@ -29,5 +30,6 @@ router.get("/:callId/transcript", getCallTranscript);
 
 // Meeting Summary Document
 router.post("/summary", saveMeetingSummary);
+router.post("/:id/generate-summary", generateCallSummary);
 
 export default router;
