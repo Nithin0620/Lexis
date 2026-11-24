@@ -113,25 +113,20 @@ export const joinRoomByCode = async (req: AuthRequest, res: Response) => {
       return res.status(404).json({ error: "Room not found with this code" });
     }
 
-    // Check if user is already a member
-    let memberRecord = await prisma.roomMember.findUnique({
+    const memberRecord = await prisma.roomMember.upsert({
       where: {
         userId_roomId: {
           userId: req.user.id,
           roomId: room.id,
         },
       },
+      create: {
+        userId: req.user.id,
+        roomId: room.id,
+        role: "member",
+      },
+      update: {},
     });
-
-    if (!memberRecord) {
-      memberRecord = await prisma.roomMember.create({
-        data: {
-          userId: req.user.id,
-          roomId: room.id,
-          role: "member",
-        },
-      });
-    }
 
     return res.json({
       message: "Joined room successfully",
