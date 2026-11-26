@@ -3,6 +3,10 @@ import crypto from "crypto";
 import { AccessToken } from "livekit-server-sdk";
 import prisma from "../prisma";
 import { AuthRequest } from "../middlewares/auth.middleware";
+import {
+  getOrCreateActiveCall,
+  syncLiveKitRoomMetadata,
+} from "../services/call.service";
 
 const LIVEKIT_API_KEY = process.env.LIVEKIT_API_KEY || "devkey";
 const LIVEKIT_API_SECRET = process.env.LIVEKIT_API_SECRET || "secret";
@@ -334,7 +338,6 @@ export const getLiveKitToken = async (req: AuthRequest, res: Response) => {
       return res.status(404).json({ error: "Room not found" });
     }
 
-    // Verify user is a member of this room
     const isMember = await prisma.roomMember.findUnique({
       where: {
         userId_roomId: {
@@ -348,10 +351,25 @@ export const getLiveKitToken = async (req: AuthRequest, res: Response) => {
       return res.status(403).json({ error: "You must join this room before connecting to the call" });
     }
 
-    // Generate LiveKit Access Token
+    const activeCall = await getOrCreateActiveCall(roomId, req.user.id);
+
+    if (!activeCall) {
+      return res.status(404).json({ error: "Room not found" });
+    }
+
+    const metadata = await syncLiveKitRoomMetadata(
+      activeCall.room,
+      activeCall.call
+    );
+
     const at = new AccessToken(LIVEKIT_API_KEY, LIVEKIT_API_SECRET, {
       identity: req.user.id,
       name: req.user.name,
+      attributes: {
+        callId: metadata.callId,
+        roomId: metadata.roomId,
+        roomCode: metadata.roomCode,
+      },
     });
 
     at.addGrant({
@@ -367,6 +385,7 @@ export const getLiveKitToken = async (req: AuthRequest, res: Response) => {
       token,
       serverUrl: LIVEKIT_URL,
       roomName: room.liveKitRoomId,
+      callId: metadata.callId,
     });
   } catch (error) {
     console.error("LiveKit token error:", error);

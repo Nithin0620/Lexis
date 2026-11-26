@@ -1,6 +1,6 @@
 # Lexis: End-to-End System Architecture & Roadmap
 
-This document serves as the master engineering blueprint for **Lexis**, an AI-powered real-time group meeting platform. It details everything built so far, the remaining backend tasks (major and minor), the Voice AI streaming pipeline, and the frontend implementation roadmap.
+This document serves as the master engineering blueprint for **Lexis**, an AI-powered real-time group meeting platform. It details the implemented wake-word-gated voice pipeline, transcript-first persistence, on-demand retrieval, usage telemetry, and the original backend/frontend roadmap.
 
 ---
 
@@ -37,6 +37,7 @@ Lexis/
 - `TranscriptSegment`: Individual spoken sentences with `speakerName`, `speakerId`, `content`, `sequence`, `isAi`.
 - `MeetingSummary`: AI-generated document with `overview`, `decisions`, `actionItems`, and `participantNotes`.
 - `AIUsage`: Token counting (`inputTokens`, `outputTokens`) and cost estimation (`estimatedCost`).
+- `AgentEvent`: Wake-word hits, blocked false triggers, AI mute blocks, context-tool calls, and LLM start/completion events with latency and metadata.
 
 ### B. Backend REST APIs (`backend/`)
 - **Auth (`/api/auth`)**:
@@ -51,86 +52,69 @@ Lexis/
   - `GET /my`: Fetches all user's rooms.
   - `GET /:identifier`: Fetches room details, members, and active call.
   - `PUT /:id` & `DELETE /:id`: Host controls.
-  - `POST /token`: Signs LiveKit WebRTC `AccessToken` with `canPublish` and `canSubscribe`.
+   - `POST /token`: Ensures an active call, syncs LiveKit room metadata with `callId`, adds participant attributes, then signs the WebRTC `AccessToken`.
 - **Calls & Transcripts (`/api/calls`)**:
-  - `POST /start`: Initiates or returns active room call.
-  - `POST /join` & `POST /leave`: Participant tracking.
-  - `PUT /:id/end`: Completes call, updates timestamps.
-  - `GET /:id`: Full call inspection (participants, stats, transcripts, summary).
-  - `POST /transcript/segment`: Ingests speech segments; automatically calculates duration and increments participant's `speakingSeconds` and `wordsSpoken`.
-  - `GET /:callId/transcript`: Full ordered transcript.
-  - `POST /summary`: Manual summary save.
-  - `POST /:id/generate-summary`: **AI Meeting Intelligence Generator** powered by Gemini 2.0 Flash / OpenAI.
+   - `POST /start`: Initiates or returns active room call and syncs LiveKit room metadata.
+   - `POST /join` & `POST /leave`: Participant tracking.
+   - `PUT /:id/end`: Completes call, updates timestamps.
+   - `GET /:id`: Full call inspection including participants, transcript, summary, `aiUsages`, and `agentEvents`.
+   - `POST /transcript/segment`: Ingests every finalized speech segment with speaker, sequence, and timing; updates `speakingSeconds` and `wordsSpoken`.
+   - `GET /:callId/transcript`: Full ordered transcript.
+   - `GET /:callId/context?query=...&limit=...`: Service-token-protected, query-aware compact context retrieval for the agent function tool.
+   - `POST /telemetry`: Service-token-protected agent event ingestion; writes `AgentEvent`, and for `llm_call_completed` also writes `AIUsage` and increments `aiInteractions`.
+   - `POST /summary`: Manual summary save.
+   - `POST /:id/generate-summary`: **AI Meeting Intelligence Generator** powered by Gemini 2.5 Flash / OpenAI.
 - **Security & Internal Auth**:
-  - `x-service-token` authentication in `auth.middleware.ts` allowing the Python agent worker to communicate with Express securely.
+   - `x-service-token` authentication in `auth.middleware.ts` allowing the Python agent worker to communicate with Express securely.
 
 ### C. LiveKit Voice Agent Worker (`agent/agent.py`)
 - Built using **Python 3.12** and official **`livekit-agents` v1.8+**.
-- **Silero VAD**: Real-time voice activity detection with 500ms endpointing.
-- **STT**: Deepgram Nova-2 / OpenAI.
-- **LLM**: GPT-4o-mini / Gemini with room-specific prompts.
+- **Silero VAD**: Real-time voice activity detection with fixed endpointing.
+- **STT**: Deepgram Nova-2 / OpenAI. STT runs continuously for the whole call.
+- **LLM**: GPT-4o-mini / Gemini 2.5 Flash with room-specific prompts.
 - **TTS**: Cartesia Sonic / OpenAI Alloy.
 - **Barge-in / Interruption**: Cuts off AI speech immediately if a human starts talking.
-- **Backend Sync**: Automatically fires async HTTP POSTs with `x-service-token` to `/api/calls/transcript/segment` whenever anyone (human or AI) finishes a sentence.
+- **Hard wake-word gate**: Word-boundary `Lexis` family matching in `on_user_turn_completed`; non-matching turns raise `StopResponse()` before LLM generation. Preemptive generation is disabled so no speculative LLM request starts before the gate.
+- **TTS-only acknowledgement**: A bare wake word is answered with a canned phrase, without an LLM call.
+- **Backend Sync**: Posts every finalized human and AI segment to `/api/calls/transcript/segment`, independent of wake-word state.
+- **On-demand retrieval**: The `get_meeting_context(query, limit)` function tool calls `/api/calls/:callId/context` only when the LLM needs earlier meeting context.
+- **Telemetry**: Posts wake hits, false-trigger blocks, AI mute blocks, tool calls, and LLM token/latency metrics to `/api/calls/telemetry`.
 
 ---
 
-## 3. The 2 Immediate Remaining Backend Items
+## 3. Implemented Cost-Control Pipeline
 
-### Item 2: LiveKit Webhook Receiver (`POST /api/livekit/webhook`)
-* **Problem it solves**: If a user closes their browser tab, loses WiFi, or shuts their laptop, the frontend cannot send a `POST /leave` request.
-* **Implementation Plan**:
-  1. Create `backend/controller/webhook.controller.ts`.
-  2. Use `WebhookReceiver` from `livekit-server-sdk`:
-     ```typescript
-     import { WebhookReceiver } from "livekit-server-sdk";
-     const receiver = new WebhookReceiver(LIVEKIT_API_KEY, LIVEKIT_API_SECRET);
-     ```
-  3. LiveKit sends events:
-     - `participant_left`: Match `event.participant.identity` (which is `userId`) and update `CallParticipant.leftAt = new Date()`.
-     - `room_finished`: When the LiveKit room closes, update `Call.status = "completed"` and `Call.endedAt = new Date()`.
-  4. Mount route at `POST /api/livekit/webhook` (must use raw body for signature verification).
+### Why STT stays on
+STT is the system's source of truth for the meeting record. Every finalized utterance is persisted as a `TranscriptSegment` and appended to `Transcript.fullText`, even when Lexis is silent. This keeps the meeting history complete and makes retrieval possible later.
 
----
+### Why persistence is independent of the LLM
+Transcript posting happens in the `user_input_transcribed` event handler. The wake-word gate only decides whether the LLM may reply; it never decides whether speech is stored. A normal three-person conversation therefore produces transcript rows and zero LLM requests.
 
-### Item 4: User Analytics & Lifetime Dashboard (`GET /api/users/analytics`)
-* **Problem it solves**: Powers the user's personal meeting dashboard with high-level intelligence and lifetime ROI metrics.
-* **Implementation Plan**:
-  1. Create `backend/controller/user.controller.ts` and `backend/routes/user.routes.ts`.
-  2. Query Prisma aggregates for `req.user.id`:
-     - Total meetings attended: `prisma.callParticipant.count({ where: { userId } })`.
-     - Total speaking time: `prisma.callParticipant.aggregate({ where: { userId }, _sum: { speakingSeconds: true } })`.
-     - Total words spoken: `_sum: { wordsSpoken: true }`.
-     - Total AI interactions: `_sum: { aiInteractions: true }`.
-     - Total AI token costs: `prisma.aIUsage.aggregate({ where: { userId }, _sum: { estimatedCost: true } })`.
-     - Recent meetings list: Last 5 calls with their summary overviews.
+### Why the gate happens before the LLM
+`LexisAgent.on_user_turn_completed` checks for a whole-word Lexis-family phrase before the reply pipeline runs. Non-matching turns raise `StopResponse()`. Preemptive generation is disabled, so the LLM cannot speculatively generate before that check. A bare wake word is handled by direct TTS only.
+
+### Why context is retrieved on demand
+The live system prompt does not include the full transcript. When the user asks about earlier discussion, decisions, or action items, the LLM calls `get_meeting_context(query, limit)`. That tool queries `/api/calls/:callId/context`, which returns a compact, query-ranked set of transcript lines.
+
+### How cost control is proven
+Agent events (`wake_word_hit`, `false_trigger_blocked`, `ai_muted_turn`, `llm_call_started`, `llm_call_completed`, `context_tool_called`) are written to `AgentEvent`. Each LLM completion also writes an `AIUsage` row with input/output tokens, estimated cost, and latency, and increments the triggering participant's `aiInteractions`. `DEMO.md` and `backend/scripts/verify-demo.ts` turn this into a repeatable assertion.
 
 ---
 
-## 4. Remaining Backend Details (Edge Cases, Production Hardening)
+## 4. Design Decisions
 
-Even if seemingly minor, these items make the backend 100% production-grade:
+1. **LiveKit over hosted meeting bots**: LiveKit provides separate authenticated participant audio tracks, so speaker attribution is exact without ML diarization. It also gives the agent first-class room metadata and data messages.
+2. **Managed STT/TTS APIs instead of custom speech models**: Deepgram/OpenAI STT and Cartesia/OpenAI TTS are production-grade managed services. The project's differentiation is orchestration, turn control, retrieval, and telemetry, not training speech models.
+3. **Function tool first, MCP optional**: The primary retrieval path is a controlled Python function tool calling a service-token-protected backend endpoint. Exposing the same endpoint through MCP later is optional and does not change the core architecture.
+4. **Preemptive generation disabled**: Speculative LLM calls would waste tokens in a group call where most turns are not addressed to Lexis. Disabling it makes the hard gate meaningful.
+5. **Indexed high-frequency queries**: `TranscriptSegment`, `CallParticipant`, and `AgentEvent` have indexes aligned with call/sequence/event-time lookups.
 
-1. **Centralized Error Handling Middleware (`backend/middlewares/error.middleware.ts`)**:
-   - Catches unhandled promise rejections and Prisma errors (e.g., `P2002` unique constraint violation) and converts them into user-friendly JSON responses instead of crashing or returning 500.
-2. **Room Metadata Sync on Call Start**:
-   - In `backend/controller/call.controller.ts`, when a call starts, use `RoomServiceClient` from `livekit-server-sdk` to update LiveKit room metadata with `{ callId: call.id, aiPrompt: room.aiPrompt }`. This guarantees the Python agent receives the `callId` dynamically upon connection.
-3. **Database Performance Indexing (`backend/prisma/schema.prisma`)**:
-   - Add explicit indexes for high-frequency queries:
-     ```prisma
-     model TranscriptSegment {
-       // ...
-       @@index([transcriptId, sequence])
-     }
-     model CallParticipant {
-       // ...
-       @@index([callId, userId])
-     }
-     ```
-4. **CORS Whitelist Configuration**:
-   - Update `app.use(cors())` in `server.ts` to explicitly allow `process.env.FRONTEND_URL || "http://localhost:3000"`.
-5. **Rate Limiting**:
-   - Add `express-rate-limit` on `/api/auth/login` and `/api/auth/register` (e.g., max 10 requests per minute per IP) to prevent credential stuffing.
+### Optional Backend Hardening Backlog
+
+- LiveKit webhook receiver for `participant_left` and `room_finished`.
+- User lifetime analytics endpoint.
+- Centralized error middleware.
+- Explicit CORS whitelist and auth rate limiting.
 
 ---
 
@@ -144,41 +128,60 @@ flowchart TD
     end
 
     subgraph LiveKit["LiveKit SFU (WebRTC Server)"]
-        TrackA["Participant A Audio Track"]
-        TrackB["Participant B Audio Track"]
+        Tracks["Participant Audio Tracks<br/>with callId + aiMuted room metadata"]
         AgentTrack["Lexis AI Audio Track"]
     end
 
     subgraph PythonAgent["LiveKit Voice Agent Worker (agent.py)"]
-        VAD["Silero VAD\n(Voice Activity Detection)"]
-        STT["Speech-to-Text\n(Deepgram / OpenAI)"]
-        Filter{"Group Call\nTrigger Check"}
-        LLM["LLM Streaming\n(GPT-4o-mini / Gemini)"]
-        TTS["Streaming TTS\n(Cartesia / OpenAI)"]
+        VAD["Silero VAD"]
+        STT["Continuous STT<br/>(Deepgram / OpenAI)"]
+        Persist["user_input_transcribed<br/>post every finalized segment"]
+        Gate{"on_user_turn_completed<br/>hard wake-word gate"}
+        Stop["StopResponse<br/>no LLM request"]
+        Bare["Bare wake word<br/>TTS-only acknowledgement"]
+        LLM["LLM Streaming<br/>(GPT-4o-mini / Gemini 2.5 Flash)"]
+        Tool["get_meeting_context(query, limit)"]
+        TTS["Streaming TTS<br/>(Cartesia / OpenAI)"]
+        Telemetry["post_agent_event<br/>+ LLMMetrics listener"]
     end
 
     subgraph BackendAPI["Express + Postgres Backend"]
         DB[(Neon PostgreSQL)]
-        StatsAPI["/api/calls/transcript/segment\n(Updates speaking time & words)"]
-        SummaryAPI["/api/calls/:id/generate-summary\n(LLM Meeting Intelligence)"]
+        TranscriptAPI["/api/calls/transcript/segment"]
+        ContextAPI["/api/calls/:callId/context"]
+        TelemetryAPI["/api/calls/telemetry"]
+        SummaryAPI["/api/calls/:id/generate-summary"]
     end
 
-    Mic --> TrackA
-    TrackA --> VAD
-    TrackB --> VAD
-    VAD -->|Speech Boundary Detected| STT
-    STT -->|Finalized Sentence| StatsAPI
-    StatsAPI --> DB
+    Mic --> Tracks
+    Tracks --> VAD
+    VAD --> STT
+    STT --> Persist
+    Persist --> TranscriptAPI
+    TranscriptAPI --> DB
 
-    STT --> Filter
-    Filter -->|AI Addressed / Conversational| LLM
-    LLM -->|Streamed Tokens| TTS
-    TTS -->|Audio Packets| AgentTrack
+    STT --> Gate
+    Gate -->|AI muted or no wake word| Stop
+    Gate -->|bare wake word| Bare
+    Gate -->|wake word plus utterance| LLM
+    LLM --> Tool
+    Tool --> ContextAPI
+    ContextAPI --> DB
+    LLM -->|streamed tokens| TTS
+    Bare --> TTS
+    TTS --> AgentTrack
     AgentTrack --> Speaker
 
-    VAD -.->|Interruption / Barge-in| TTS
+    VAD -.->|barge-in| TTS
+    Gate --> Telemetry
+    LLM --> Telemetry
+    Tool --> Telemetry
+    Telemetry --> TelemetryAPI
+    TelemetryAPI --> DB
     DB --> SummaryAPI
 ```
+
+Normal conversation follows `STT -> Persist -> TranscriptAPI -> DB` and stops at the gate. Only the wake-word branch reaches the LLM. This is the invariant the demo verifies.
 
 ---
 
@@ -274,5 +277,11 @@ NEXT_PUBLIC_LIVEKIT_URL=wss://your-project.livekit.cloud
 - [x] AI Meeting Summary generator service verified.
 - [x] Agent service authentication (`x-service-token`) verified.
 - [x] Python LiveKit Voice Agent worker created with Silero VAD, STT, LLM, TTS, and barge-in.
-- [ ] **Next**: Item 2 (LiveKit Webhook) & Item 4 (User Analytics Endpoint).
-- [ ] **Next**: Frontend implementation (Next.js UI).
+- [x] Continuous transcript persistence independent of LLM invocation.
+- [x] Hard wake-word gate before LLM, with preemptive generation disabled.
+- [x] On-demand `get_meeting_context` function tool backed by a compact backend context endpoint.
+- [x] `AgentEvent` / `AIUsage` telemetry for wake hits, blocked turns, tool calls, tokens, cost, and latency.
+- [x] Repeatable demo proof in `DEMO.md` and `backend/scripts/verify-demo.ts`.
+- [x] Next.js UI implemented with LiveKit room, transcript sidebar, analytics, and summary views.
+- [ ] **Optional**: LiveKit webhook receiver and user lifetime analytics endpoint.
+- [ ] **User action**: Apply `npx prisma migrate dev`, run the live 3-person demo, and run the verification script.

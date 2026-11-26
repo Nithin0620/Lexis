@@ -17,8 +17,10 @@
 
 | Document | Description |
 | :--- | :--- |
-| 📋 **[nextsteps.md](./nextsteps.md)** | **Start Here!** Sequential step-by-step checklist of remaining tasks. |
-| 📘 **[ARCHITECTURE.md](./ARCHITECTURE.md)** | Deep architectural blueprint, data flows, and technical decisions. |
+| 📋 **[plan.md](./plan.md)** | Implemented work plan and resume-ready engineering bullets. |
+| 🧪 **[DEMO.md](./DEMO.md)** | Repeatable 3-person demo, log evidence, and database proof checklist. |
+| 📘 **[ARCHITECTURE.md](./ARCHITECTURE.md)** | Architectural blueprint, target voice pipeline, and technical decisions. |
+| 📋 **[NEXT_STEPS.md](./NEXT_STEPS.md)** | Original sequential checklist of remaining tasks. |
 | 💡 **[free.md](./free.md)** | Guide to running this platform **100% free** using official provider credits. |
 
 ---
@@ -26,9 +28,11 @@
 ## ✨ Key Features
 
 - **⚡ Zero-Diarization Individual Speaker Attribution**: By leveraging LiveKit WebRTC's individual participant audio tracks, Lexis identifies speakers directly from their connection tokens with 100% precision—no complex or buggy ML diarization models needed.
-- **🤖 Autonomous Voice AI Participant**: An AI agent ("Lexis AI") joins the call as a real peer. It listens via Silero VAD, transcribes via Deepgram/Whisper, reasons with Gemini/GPT-4o, and streams natural voice replies with sub-second latency.
+- **🤖 Gated Voice AI Participant**: Lexis AI joins as a real peer. STT stays on for every utterance, but the LLM only runs after a whole-word wake phrase. Normal conversation produces transcript rows and zero LLM calls.
+- **🎯 On-Demand Meeting Retrieval**: When asked about earlier discussion, the agent calls `get_meeting_context(query, limit)`, which fetches compact, query-ranked lines from the persisted transcript instead of stuffing the full meeting into every prompt.
 - **🛑 Real-Time Barge-in & Interruption**: If a human interrupts the AI while it's speaking, Silero VAD immediately cuts off the AI audio track and returns the floor to the human.
-- **📊 Real-Time Per-Participant Analytics**: Tracks individual speaking duration (seconds), word counts, and questions asked for every human in the room.
+- **📊 Real-Time Per-Participant Analytics**: Tracks individual speaking duration (seconds), word counts, AI interactions, token usage, estimated cost, and latency.
+- **🔍 Demo-Proof Telemetry**: `AgentEvent` and `AIUsage` rows prove that passive talk was blocked by the gate, one wake-word turn reached the LLM, the context tool was used, and usage was recorded.
 - **📝 Automated Meeting Intelligence**: When a call wraps up, an LLM analyzes the full transcript to generate:
   - Executive Overview
   - Key Decisions Made
@@ -42,42 +46,50 @@
 ```mermaid
 flowchart TD
     subgraph Client["Next.js 16 WebRTC Frontend"]
-        UI["Meeting Room UI"]
         Mic["Microphone"]
         Spk["Speakers"]
     end
 
     subgraph SFU["LiveKit WebRTC Server"]
-        TrackA["Participant Audio Tracks"]
+        Tracks["Participant Audio Tracks<br/>callId + aiMuted metadata"]
         AITrack["Lexis AI Audio Stream"]
     end
 
     subgraph Agent["Python 3.12 Voice Agent Worker"]
-        VAD["Silero VAD\n(~200ms Voice Detection)"]
-        STT["Streaming STT\n(Deepgram / OpenAI)"]
-        LLM["LLM Streaming\n(Gemini 2.0 / GPT-4o-mini)"]
-        TTS["Streaming TTS\n(Cartesia / OpenAI Alloy)"]
+        VAD["Silero VAD"]
+        STT["Continuous STT<br/>Deepgram / OpenAI"]
+        Persist["Post every finalized segment"]
+        Gate{"Hard wake-word gate<br/>StopResponse if not addressed"}
+        LLM["LLM Streaming<br/>Gemini 2.5 Flash / GPT-4o-mini"]
+        Tool["get_meeting_context"]
+        TTS["Streaming TTS<br/>Cartesia / OpenAI Alloy"]
+        Telemetry["AgentEvent + LLMMetrics"]
     end
 
     subgraph API["Express 5 + TypeScript Backend"]
-        REST["REST API & Webhooks"]
+        REST["Transcript / Context / Telemetry APIs"]
         Prisma["Prisma ORM"]
         DB[(Neon Serverless PostgreSQL)]
-        AI_Service["Meeting Summary Engine"]
+        Summary["Meeting Summary Engine"]
     end
 
-    Mic --> TrackA
-    TrackA --> VAD
-    VAD --> STT
-    STT -->|Speech Segments & Word Counts| REST
+    Mic --> Tracks --> VAD --> STT
+    STT --> Persist --> REST
     REST --> Prisma --> DB
 
-    STT --> LLM --> TTS --> AITrack
-    AITrack --> Spk
-    VAD -.->|Interruption Cut-off| TTS
-
-    DB --> AI_Service -->|Executive Report| DB
+    STT --> Gate
+    Gate -->|no wake word| GateStop["No LLM request"]
+    Gate -->|wake word| LLM
+    LLM --> Tool --> REST
+    LLM --> TTS --> AITrack --> Spk
+    VAD -.->|barge-in| TTS
+    Gate --> Telemetry
+    LLM --> Telemetry
+    Telemetry --> REST
+    DB --> Summary --> DB
 ```
+
+Passive conversation follows `STT -> Persist -> DB` and stops at `Gate`. Only an explicit wake-word turn reaches the LLM.
 
 ---
 
@@ -90,7 +102,7 @@ flowchart TD
 | **Database** | PostgreSQL (Neon Serverless Postgres) |
 | **Real-Time Media** | LiveKit SFU (WebRTC Audio & Video) |
 | **Voice AI Agent** | Python 3.12, `livekit-agents` v1.8+, Silero VAD, `aiohttp` |
-| **AI Providers** | Google Gemini 2.0 Flash (Free LLM), Deepgram Nova-2 (STT), OpenAI GPT-4o-mini / Whisper, Cartesia Sonic (TTS) |
+| **AI Providers** | Google Gemini 2.5 Flash / GPT-4o-mini (LLM), Deepgram Nova-2 / OpenAI (STT), Cartesia Sonic / OpenAI Alloy (TTS) |
 
 ---
 
@@ -102,7 +114,8 @@ Lexis/
 │   ├── controller/           # auth, room, call controllers
 │   ├── middlewares/          # auth & service token middleware
 │   ├── routes/               # Express route declarations
-│   ├── services/             # ai.service.ts (Gemini & OpenAI summarizer)
+│   ├── services/             # ai, livekit, and call services
+│   ├── scripts/              # verify-demo.ts database evidence checker
 │   ├── prisma/               # schema.prisma & PostgreSQL migrations
 │   ├── server.ts             # Server entry point
 │   └── package.json
@@ -119,7 +132,9 @@ Lexis/
 │   └── tailwind.config.ts
 │
 ├── free.md                   # Complete guide to 100% free credits
-├── nextsteps.md              # Action checklist for next development steps
+├── NEXT_STEPS.md             # Original action checklist
+├── plan.md                   # Implemented work plan
+├── DEMO.md                   # Repeatable live demo checklist
 ├── ARCHITECTURE.md           # Master blueprint & technical spec
 └── Readme.md                 # This file
 ```
@@ -139,6 +154,7 @@ Lexis/
 ```bash
 cd backend
 npm install
+npx prisma migrate dev
 npx prisma generate
 npm run dev
 ```
@@ -164,6 +180,16 @@ npm install
 npm run dev
 ```
 *App will run at `http://localhost:3000`.*
+
+---
+
+### 5. Verify a Demo Call
+Follow [DEMO.md](./DEMO.md) for the live script. After a call ends, check the database evidence with:
+
+```bash
+cd backend
+npx tsx scripts/verify-demo.ts --call-id <call-id> --passive-end <epoch-ms>
+```
 
 ---
 
@@ -193,8 +219,11 @@ npm run dev
 | :--- | :--- | :--- |
 | `POST` | `/api/calls/start` | Start or retrieve active call in room |
 | `PUT`  | `/api/calls/:id/end` | End call and calculate duration |
-| `POST` | `/api/calls/transcript/segment` | Save speech chunk, auto-update speaking time & words |
+| `POST` | `/api/calls/transcript/segment` | Save every finalized speech chunk, auto-update speaking time & words |
 | `GET`  | `/api/calls/:callId/transcript` | Get full transcript with segments |
+| `GET`  | `/api/calls/:callId/context` | Service-token-protected compact transcript context for the agent |
+| `POST` | `/api/calls/telemetry` | Service-token-protected agent events, token usage, and cost telemetry |
+| `GET`  | `/api/calls/:id` | Call details including participants, usage, and agent events |
 | `POST` | `/api/calls/:id/generate-summary` | **Trigger AI to generate meeting report** |
 
 ---

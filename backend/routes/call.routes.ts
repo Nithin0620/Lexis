@@ -7,6 +7,8 @@ import {
   getCallDetails,
   saveTranscriptSegment,
   getCallTranscript,
+  getCallContext,
+  recordAgentTelemetry,
   saveMeetingSummary,
   generateCallSummary,
 } from "../controller/call.controller";
@@ -27,6 +29,10 @@ router.get("/:id", getCallDetails);
 // Transcripts
 router.post("/transcript/segment", saveTranscriptSegment);
 router.get("/:callId/transcript", getCallTranscript);
+router.get("/:callId/context", getCallContext);
+
+// Agent telemetry
+router.post("/telemetry", recordAgentTelemetry);
 
 // Meeting Summary Document
 router.post("/summary", saveMeetingSummary);

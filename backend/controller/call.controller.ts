@@ -2,6 +2,10 @@ import { Response } from "express";
 import prisma from "../prisma";
 import { AuthRequest } from "../middlewares/auth.middleware";
 import { generateMeetingSummaryFromTranscript } from "../services/ai.service";
+import {
+  getOrCreateActiveCall,
+  syncLiveKitRoomMetadata,
+} from "../services/call.service";
 
 /**
  * 1. Start a Call in a Room
@@ -30,7 +34,6 @@ export const startCall = async (req: AuthRequest, res: Response) => {
       return res.status(404).json({ error: "Room not found" });
     }
 
-    // Verify user is a member of the room
     const membership = await prisma.roomMember.findUnique({
       where: {
         userId_roomId: {
@@ -44,12 +47,16 @@ export const startCall = async (req: AuthRequest, res: Response) => {
       return res.status(403).json({ error: "You must join this room first" });
     }
 
-    // Check for an existing active call
-    let call = await prisma.call.findFirst({
-      where: {
-        roomId: room.id,
-        status: "active",
-      },
+    const activeCall = await getOrCreateActiveCall(roomId, req.user.id);
+
+    if (!activeCall) {
+      return res.status(404).json({ error: "Room not found" });
+    }
+
+    await syncLiveKitRoomMetadata(activeCall.room, activeCall.call);
+
+    const call = await prisma.call.findUnique({
+      where: { id: activeCall.call.id },
       include: {
         participants: {
           include: {
@@ -58,43 +65,6 @@ export const startCall = async (req: AuthRequest, res: Response) => {
         },
       },
     });
-
-    if (!call) {
-      // Create new call
-      call = await prisma.call.create({
-        data: {
-          roomId: room.id,
-          status: "active",
-          startedAt: new Date(),
-        },
-        include: {
-          participants: {
-            include: {
-              user: { select: { id: true, name: true, avatar: true } },
-            },
-          },
-        },
-      });
-    }
-
-    // Add current user to participants if not already in call
-    const activeParticipant = await prisma.callParticipant.findFirst({
-      where: {
-        callId: call.id,
-        userId: req.user.id,
-        leftAt: null,
-      },
-    });
-
-    if (!activeParticipant) {
-      await prisma.callParticipant.create({
-        data: {
-          callId: call.id,
-          userId: req.user.id,
-          joinedAt: new Date(),
-        },
-      });
-    }
 
     return res.status(200).json({
       message: "Call started / active",
@@ -281,6 +251,7 @@ export const getCallDetails = async (req: AuthRequest, res: Response) => {
         },
         meetingSummary: true,
         aiUsages: true,
+        agentEvents: { orderBy: { createdAt: "asc" } },
       },
     });
 
@@ -319,7 +290,7 @@ export const saveTranscriptSegment = async (req: AuthRequest, res: Response) => 
       return res.status(400).json({ error: "callId and content are required" });
     }
 
-    const speakerUserId = speakerId || (isAi ? null : req.user.id);
+    const speakerUserId = speakerId || (isAi || req.isService ? null : req.user.id);
     const duration = Math.max(0, (Number(endTime) || 0) - (Number(startTime) || 0));
     const wordCount = content.trim().split(/\s+/).filter(Boolean).length;
 
@@ -423,7 +394,223 @@ export const getCallTranscript = async (req: AuthRequest, res: Response) => {
 };
 
 /**
- * 8. Save or Update Generated Meeting Summary Document
+ * 8. Get Compact Transcript Context for On-Demand Retrieval
+ */
+export const getCallContext = async (req: AuthRequest, res: Response) => {
+  try {
+    if (!req.isService) {
+      return res.status(403).json({ error: "Service token required" });
+    }
+
+    const callId = req.params.callId as string;
+    const queryParam = Array.isArray(req.query.query)
+      ? req.query.query[0]
+      : req.query.query;
+    const limitParam = Array.isArray(req.query.limit)
+      ? req.query.limit[0]
+      : req.query.limit;
+    const parsedLimit = Number.parseInt(
+      typeof limitParam === "string" ? limitParam : "20",
+      10
+    );
+    const limit = Math.min(
+      Math.max(Number.isFinite(parsedLimit) ? parsedLimit : 20, 1),
+      50
+    );
+    const query = typeof queryParam === "string" ? queryParam.trim() : "";
+
+    const transcript = await prisma.transcript.findUnique({
+      where: { callId },
+      select: {
+        segments: {
+          orderBy: { sequence: "desc" },
+          take: 500,
+          select: {
+            speakerName: true,
+            content: true,
+            sequence: true,
+            startTime: true,
+            endTime: true,
+          },
+        },
+      },
+    });
+
+    const segments = transcript?.segments ?? [];
+
+    if (!query || segments.length === 0) {
+      return res.json({
+        callId,
+        query,
+        totalSegments: segments.length,
+        matchedSegments: segments.length,
+        segments: segments.slice(0, limit),
+      });
+    }
+
+    const stopWords = new Set([
+      "what", "whats", "did", "we", "you", "they", "was", "were", "the",
+      "a", "an", "and", "or", "about", "that", "this", "who", "when",
+      "where", "how", "said", "say", "says", "anything", "something",
+    ]);
+    const expansions: Record<string, string[]> = {
+      decide: ["decid", "decision", "agreed", "concluded", "resolved"],
+      decided: ["decid", "decision", "agreed", "concluded", "resolved"],
+      decision: ["decid", "decision", "agreed", "concluded", "resolved"],
+      decisions: ["decid", "decision", "agreed", "concluded", "resolved"],
+      action: ["action", "todo", "task", "follow up", "owner", "responsible"],
+      actions: ["action", "todo", "task", "follow up", "owner", "responsible"],
+      summary: ["summary", "recap", "overview", "key points"],
+      summarize: ["summary", "recap", "overview", "key points"],
+      owner: ["owner", "own", "assigned", "responsible"],
+      owns: ["owner", "own", "assigned", "responsible"],
+    };
+
+    const terms = Array.from(
+      new Set(
+        (query.toLowerCase().match(/[a-z0-9]+/g) ?? [])
+          .filter((term) => term.length > 2 && !stopWords.has(term))
+          .flatMap((term) => expansions[term] ?? [term])
+      )
+    );
+
+    const ranked = segments.map((segment) => ({
+      ...segment,
+      score: terms.reduce(
+        (total, term) =>
+          total + (segment.content.toLowerCase().includes(term) ? 1 : 0),
+        0
+      ),
+    }));
+    const matched = ranked
+      .filter((segment) => segment.score > 0)
+      .sort((a, b) => b.score - a.score || b.sequence - a.sequence);
+
+    const selected = matched.length > 0 ? matched.slice(0, limit) : ranked.slice(0, limit);
+
+    return res.json({
+      callId,
+      query,
+      totalSegments: segments.length,
+      matchedSegments: matched.length,
+      segments: selected.map(({ score: _score, ...segment }) => segment),
+    });
+  } catch (error) {
+    console.error("Get call context error:", error);
+    return res.status(500).json({ error: "Internal server error" });
+  }
+};
+
+/**
+ * 10. Record Agent Telemetry and LLM Usage
+ */
+export const recordAgentTelemetry = async (req: AuthRequest, res: Response) => {
+  try {
+    if (!req.isService) {
+      return res.status(403).json({ error: "Service token required" });
+    }
+
+    const {
+      callId,
+      eventType,
+      timestamp,
+      speakerId,
+      model,
+      inputTokens,
+      outputTokens,
+      estimatedCost,
+      latencyMs,
+      metadata,
+    } = req.body;
+
+    const allowedEvents = new Set([
+      "wake_word_hit",
+      "llm_call_started",
+      "llm_call_completed",
+      "context_tool_called",
+      "false_trigger_blocked",
+      "ai_muted_turn",
+    ]);
+
+    if (!callId || !allowedEvents.has(eventType)) {
+      return res.status(400).json({ error: "callId and a valid eventType are required" });
+    }
+
+    const call = await prisma.call.findUnique({
+      where: { id: callId },
+      select: { id: true },
+    });
+
+    if (!call) {
+      return res.status(404).json({ error: "Call not found" });
+    }
+
+    const numericTimestamp = Number(timestamp);
+    const createdAt =
+      Number.isFinite(numericTimestamp) && numericTimestamp > 0
+        ? new Date(numericTimestamp)
+        : new Date();
+
+    await prisma.agentEvent.create({
+      data: {
+        callId,
+        eventType,
+        speakerId: speakerId || null,
+        model: model || null,
+        latencyMs: Math.max(0, Number(latencyMs) || 0),
+        metadata: metadata && typeof metadata === "object" ? metadata : {},
+        createdAt,
+      },
+    });
+
+    if (eventType === "llm_call_completed") {
+      const input = Math.max(0, Number(inputTokens) || 0);
+      const output = Math.max(0, Number(outputTokens) || 0);
+      const modelKey = String(model || "").toLowerCase();
+      const pricing = [
+        { match: "gemini-2.5-flash", input: 0.3, output: 2.5 },
+        { match: "gemini", input: 0.3, output: 2.5 },
+        { match: "gpt-4o-mini", input: 0.15, output: 0.6 },
+      ];
+      const rate = pricing.find((entry) => modelKey.includes(entry.match)) ?? {
+        match: "default",
+        input: 0.15,
+        output: 0.6,
+      };
+      const cost =
+        estimatedCost !== undefined && estimatedCost !== null
+          ? Math.max(0, Number(estimatedCost) || 0)
+          : (input / 1_000_000) * rate.input + (output / 1_000_000) * rate.output;
+
+      await prisma.aIUsage.create({
+        data: {
+          callId,
+          userId: speakerId || null,
+          model: model || "unknown",
+          inputTokens: input,
+          outputTokens: output,
+          estimatedCost: cost,
+          createdAt,
+        },
+      });
+
+      if (speakerId) {
+        await prisma.callParticipant.updateMany({
+          where: { callId, userId: speakerId },
+          data: { aiInteractions: { increment: 1 } },
+        });
+      }
+    }
+
+    return res.status(201).json({ message: "Agent telemetry recorded" });
+  } catch (error) {
+    console.error("Record agent telemetry error:", error);
+    return res.status(500).json({ error: "Internal server error" });
+  }
+};
+
+/**
+ * 11. Save or Update Generated Meeting Summary Document
  */
 export const saveMeetingSummary = async (req: AuthRequest, res: Response) => {
   try {

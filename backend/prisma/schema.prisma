@@ -62,6 +62,7 @@ model Call {
   transcript     Transcript?
   meetingSummary MeetingSummary?
   aiUsages       AIUsage[]
+  agentEvents    AgentEvent[]
 }
 
 model CallParticipant {
@@ -128,4 +129,18 @@ model AIUsage {
   ttsDuration   Float    @default(0)
   estimatedCost Float    @default(0)
   createdAt     DateTime @default(now())
+}
+
+model AgentEvent {
+  id         String   @id @default(uuid())
+  callId     String
+  call       Call     @relation(fields: [callId], references: [id], onDelete: Cascade)
+  eventType  String
+  speakerId  String?
+  model      String?
+  latencyMs  Float    @default(0)
+  metadata   Json     @default("{}")
+  createdAt  DateTime @default(now())
+
+  @@index([callId, eventType, createdAt])
 }
